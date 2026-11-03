@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# ai-usage: Claude Code and Codex plan limits side by side.
+#
+# Usage:
+#   ai-usage                  print once
+#   ai-usage --watch [secs]   refresh every secs (default 30), for a side pane or dock
+#   ai-usage --short          one plain line, for tmux, menu bars and prompts
+#   ai-usage --json           machine-readable output
+#   ai-usage --help
+#
+# Claude's limits come from claude-statusline, which saves them whenever a
+# Claude Code session replies. Codex's come from its session logs.
+set -u
+
+VERSION="0.1.0"
+claude_file="${AI_USAGE_CLAUDE_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/ai-usage/claude.json}"
+codex_sessions="${CODEX_HOME:-$HOME/.codex}/sessions"
+stale_after="${AI_USAGE_STALE_AFTER:-3600}"
+
+green=$'\033[32m'; yellow=$'\033[33m'; red=$'\033[31m'; dim=$'\033[2m'; bold=$'\033[1m'; reset=$'\033[0m'
+
+usage() {
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+# fmt_epoch <epoch> <format>: works with BSD (macOS) and GNU (Linux) date
+fmt_epoch() {
+  date -r "$1" "+$2" 2>/dev/null || date -d "@$1" "+$2"
+}
+
+when() {
+  if [ "$(fmt_epoch "$1" %Y%m%d)" = "$(date +%Y%m%d)" ]; then
+    fmt_epoch "$1" %H:%M
+  else
+    fmt_epoch "$1" '%a %H:%M'
+  fi
+}
+
+# Each collector sets <TOOL>_STATE (ok|none|nolimits), <TOOL>_SAVED (epoch)
+# and <TOOL>_ROWS: one "window used_percent resets_at" line per limit window.
+collect_claude() {
+  CLAUDE_STATE=none; CLAUDE_SAVED=0; CLAUDE_ROWS=""
+  [ -s "$claude_file" ] || return
+  CLAUDE_SAVED=$(jq -r '.saved_at | floor' "$claude_file")
+  CLAUDE_ROWS=$(jq -r '.rate_limits | [["5h", .five_hour], ["7d", .seven_day]][]
+    | select(.[1] != null) | "\(.[0]) \(.[1].used_percentage | floor) \(.[1].resets_at)"' "$claude_file")
+  if [ -n "$CLAUDE_ROWS" ]; then CLAUDE_STATE=ok; else CLAUDE_STATE=nolimits; fi
+}
+
+collect_codex() {
+  CODEX_STATE=none; CODEX_SAVED=0; CODEX_ROWS=""
+  local files latest
+  files=$(find "$codex_sessions" -name 'rollout-*.jsonl' -mtime -8 2>/dev/null | xargs ls -t 2>/dev/null | head -5)
+  [ -n "$files" ] || return
+  # shellcheck disable=SC2086
+  latest=$(grep -h '"rate_limits":{' $files 2>/dev/null | jq -sc 'map(select(.payload.rate_limits != null)) | max_by(.timestamp) // empty')
+  [ -n "$latest" ] || return
+  CODEX_SAVED=$(printf '%s' "$latest" | jq -r '.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdate')
+  CODEX_ROWS=$(printf '%s' "$latest" | jq -r '.payload.rate_limits | [.primary, .secondary][] | select(. != null)
+    | "\(if .window_minutes == 300 then "5h" elif .window_minutes == 10080 then "7d" else "\(.window_minutes / 60 | floor)h" end) \(.used_percent | floor) \(.resets_at)"')
+  [ -n "$CODEX_ROWS" ] && CODEX_STATE=ok
+}
+
+# effective_pct <pct> <resets_at>: a window that has already reset counts as 0
+effective_pct() {
+  if [ -n "$2" ] && [ "$2" -le "$(date +%s)" ]; then echo 0; else echo "$1"; fi
+}
+
+bar() {
+  local pct=$1 filled i out=""
+  filled=$(( (pct + 5) / 10 ))
+  [ "$filled" -gt 10 ] && filled=10
+  for ((i = 0; i < 10; i++)); do
+    if [ "$i" -lt "$filled" ]; then out+="█"; else out+="░"; fi
+  done
+  printf '%s' "$out"
+}
+
+color_for() {
+  if [ "$1" -ge 80 ]; then printf '%s' "$red"
+  elif [ "$1" -ge 50 ]; then printf '%s' "$yellow"
+  else printf '%s' "$green"; fi
+}
+
+# panel_tool <label> <state> <saved> <rows> <hint>
+panel_tool() {
+  local label=$1 state=$2 saved=$3 rows=$4 hint=$5 window pct resets
+  case "$state" in
+    none)
+      printf '%-7s %sno data yet. %s%s\n' "$label" "$dim" "$hint" "$reset"
+      return ;;
+    nolimits)
+      printf '%-7s %sno limits reported for this plan.%s\n' "$label" "$dim" "$reset"
+      return ;;
+  esac
+  while read -r window pct resets; do
+    if [ "$(effective_pct "$pct" "$resets")" = 0 ] && [ "$pct" != 0 ]; then
+      printf '%-7s %s  %s%s%s  %sreset at %s, fresh now%s\n' "$label" "$window" "$green" "$(bar 0)" "$reset" "$dim" "$(when "$resets")" "$reset"
+    else
+      printf '%-7s %s  %s%s %3d%%%s  %sresets %s%s\n' "$label" "$window" "$(color_for "$pct")" "$(bar "$pct")" "$pct" "$reset" "$dim" "$(when "$resets")" "$reset"
+    fi
+    label=""
+  done <<< "$rows"
+  if [ $(( $(date +%s) - saved )) -gt "$stale_after" ]; then
+    printf '        %sas of %s. %s%s\n' "$dim" "$(when "$saved")" "$hint" "$reset"
+  fi
+}
+
+render_panel() {
+  collect_claude
+  collect_codex
+  printf '%sAI usage%s  %s%s%s\n\n' "$bold" "$reset" "$dim" "$(date +%H:%M)" "$reset"
+  panel_tool Claude "$CLAUDE_STATE" "$CLAUDE_SAVED" "$CLAUDE_ROWS" "Updates when Claude Code replies."
+  echo
+  panel_tool Codex "$CODEX_STATE" "$CODEX_SAVED" "$CODEX_ROWS" "Updates when Codex replies."
+}
+
+# short_tool <label> <state> <rows>
+short_tool() {
+  local out=$1 window pct resets
+  if [ "$2" != ok ]; then
+    printf '%s n/a' "$1"
+    return
+  fi
+  while read -r window pct resets; do
+    out+=" $window $(effective_pct "$pct" "$resets")%"
+  done <<< "$3"
+  printf '%s' "$out"
+}
+
+render_short() {
+  collect_claude
+  collect_codex
+  printf '%s │ %s\n' "$(short_tool Claude "$CLAUDE_STATE" "$CLAUDE_ROWS")" "$(short_tool Codex "$CODEX_STATE" "$CODEX_ROWS")"
+}
+
+# json_tool <state> <saved> <rows>
+json_tool() {
+  printf '%s\n' "$3" | jq -R 'select(length > 0) | split(" ")
+      | {window: .[0], used_percent: (.[1] | tonumber), resets_at: (.[2] | tonumber)}' \
+    | jq -s --arg state "$1" --argjson saved "$2" \
+      '{state: $state, updated_at: (if $saved > 0 then $saved else null end), windows: .}'
+}
+
+render_json() {
+  collect_claude
+  collect_codex
+  jq -n --argjson claude "$(json_tool "$CLAUDE_STATE" "$CLAUDE_SAVED" "$CLAUDE_ROWS")" \
+        --argjson codex "$(json_tool "$CODEX_STATE" "$CODEX_SAVED" "$CODEX_ROWS")" \
+        '{claude: $claude, codex: $codex}'
+}
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "ai-usage needs jq: https://jqlang.org/download/" >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  -h|--help) usage ;;
+  -v|--version) echo "ai-usage $VERSION" ;;
+  --short) render_short ;;
+  --json) render_json ;;
+  --watch)
+    interval=${2:-30}
+    while true; do
+      out=$(render_panel)
+      printf '\033[H\033[2J%s\n' "$out"
+      sleep "$interval"
+    done ;;
+  "") render_panel ;;
+  *) usage >&2; exit 2 ;;
+esac

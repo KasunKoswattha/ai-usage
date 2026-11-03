@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# claude-statusline: Claude Code status line.
+# Shows model, context use and plan limits, and saves the limits to
+# ~/.cache/ai-usage/claude.json (or $AI_USAGE_CLAUDE_FILE) for ai-usage.
+input=$(cat)
+cache_file="${AI_USAGE_CLAUDE_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/ai-usage/claude.json}"
+cache_dir=$(dirname "$cache_file")
+
+if printf '%s' "$input" | jq -e '.rate_limits | type == "object"' >/dev/null 2>&1; then
+  mkdir -p "$cache_dir"
+  tmp=$(mktemp "$cache_dir/claude.XXXXXX")
+  if printf '%s' "$input" | jq -c '{saved_at: now, model: .model.display_name, rate_limits}' > "$tmp"; then
+    mv "$tmp" "$cache_file"
+  else
+    rm -f "$tmp"
+  fi
+fi
+
+printf '%s' "$input" | jq -r '
+  def pct: if . == null then "?" else (floor | tostring) + "%" end;
+  [ .model.display_name,
+    "ctx " + (.context_window.used_percentage | pct),
+    (.rate_limits.five_hour // empty | "5h " + (.used_percentage | pct)),
+    (.rate_limits.seven_day // empty | "7d " + (.used_percentage | pct))
+  ] | join(" · ")'

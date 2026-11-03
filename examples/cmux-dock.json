@@ -1,0 +1,10 @@
+{
+  "controls": [
+    {
+      "id": "ai-usage",
+      "title": "AI usage",
+      "command": "$HOME/.local/bin/ai-usage --watch 30",
+      "height": 190
+    }
+  ]
+}
