@@ -12,10 +12,12 @@
 # Claude Code session replies. Codex's come from its session logs.
 set -u
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 claude_file="${AI_USAGE_CLAUDE_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/ai-usage/claude.json}"
 codex_sessions="${CODEX_HOME:-$HOME/.codex}/sessions"
 stale_after="${AI_USAGE_STALE_AFTER:-3600}"
+cols=80
+text_max=16
 
 green=$'\033[32m'; yellow=$'\033[33m'; red=$'\033[31m'; dim=$'\033[2m'; bold=$'\033[1m'; reset=$'\033[0m'
 
@@ -76,14 +78,58 @@ effective_pct() {
   if [ -n "$2" ] && [ "$2" -le "$(date +%s)" ]; then echo 0; else echo "$1"; fi
 }
 
+# terminal_width: the panel's width, so rows can fit narrow side panes
+terminal_width() {
+  local size
+  if [ -n "${AI_USAGE_COLS:-}" ]; then echo "$AI_USAGE_COLS"; return; fi
+  size=$(stty size < /dev/tty 2>/dev/null)
+  if [ -n "$size" ]; then echo "${size#* }"; else echo 80; fi
+}
+
+# row_text <pct> <resets>: the words after the percentage
+row_text() {
+  if [ "$(effective_pct "$1" "$2")" = 0 ] && [ "$1" != 0 ]; then
+    echo "fresh since $(when "$2")"
+  elif [ "$1" -ge 100 ]; then
+    echo "full till $(when "$2")"
+  else
+    echo "resets $(when "$2")"
+  fi
+}
+
+# longest_text <rows...>: widest row_text across every row on screen
+longest_text() {
+  local rows max=0 text window pct resets
+  for rows in "$@"; do
+    [ -n "$rows" ] || continue
+    while read -r window pct resets; do
+      text=$(row_text "$pct" "$resets")
+      [ "${#text}" -gt "$max" ] && max=${#text}
+    done <<< "$rows"
+  done
+  echo "$max"
+}
+
+# bar_width: up to 10 cells, shrinking to fit; 0 hides the bar.
+# A row is "Claude  5h  <bar> 100%  resets Sat 07:00": 19 columns plus the
+# bar plus the reset text.
+bar_width() {
+  local w=$(( cols - 19 - text_max - 1 ))
+  if [ "$w" -gt 10 ]; then w=10; fi
+  if [ "$w" -lt 3 ]; then w=0; fi
+  echo "$w"
+}
+
 bar() {
-  local pct=$1 filled i out=""
-  filled=$(( (pct + 5) / 10 ))
-  [ "$filled" -gt 10 ] && filled=10
-  for ((i = 0; i < 10; i++)); do
+  local pct=$1 width filled i out=""
+  width=$(bar_width)
+  [ "$width" -eq 0 ] && return
+  filled=$(( (pct * width + 50) / 100 ))
+  [ "$filled" -gt "$width" ] && filled=$width
+  for ((i = 0; i < width; i++)); do
     if [ "$i" -lt "$filled" ]; then out+="█"; else out+="░"; fi
   done
-  printf '%s' "$out"
+  printf '%s ' "$out"
 }
 
 color_for() {
@@ -92,39 +138,41 @@ color_for() {
   else printf '%s' "$green"; fi
 }
 
-# panel_tool <label> <state> <saved> <rows> <hint>
+# panel_tool <label> <state> <saved> <rows>
 panel_tool() {
-  local label=$1 state=$2 saved=$3 rows=$4 hint=$5 window pct resets
+  local label=$1 state=$2 saved=$3 rows=$4 window pct resets text
   case "$state" in
     none)
-      printf '%-7s %sno data yet. %s%s\n' "$label" "$dim" "$hint" "$reset"
+      printf '%-7s %sno data yet%s\n' "$label" "$dim" "$reset"
       return ;;
     nolimits)
-      printf '%-7s %sno limits reported for this plan.%s\n' "$label" "$dim" "$reset"
+      printf '%-7s %sno plan limits%s\n' "$label" "$dim" "$reset"
       return ;;
   esac
   while read -r window pct resets; do
+    text=$(row_text "$pct" "$resets")
     if [ "$(effective_pct "$pct" "$resets")" = 0 ] && [ "$pct" != 0 ]; then
-      printf '%-7s %s  %s%s%s  %sreset at %s, fresh now%s\n' "$label" "$window" "$green" "$(bar 0)" "$reset" "$dim" "$(when "$resets")" "$reset"
+      printf '%-7s %s  %s%s  0%%%s  %s%s%s\n' "$label" "$window" "$green" "$(bar 0)" "$reset" "$dim" "$text" "$reset"
     elif [ "$pct" -ge 100 ]; then
-      printf '%-7s %s  %s%s %3d%%  limit reached, resets %s%s\n' "$label" "$window" "$red" "$(bar 100)" "$pct" "$(when "$resets")" "$reset"
+      printf '%-7s %s  %s%s%3d%%  %s%s\n' "$label" "$window" "$red" "$(bar 100)" "$pct" "$text" "$reset"
     else
-      printf '%-7s %s  %s%s %3d%%%s  %sresets %s%s\n' "$label" "$window" "$(color_for "$pct")" "$(bar "$pct")" "$pct" "$reset" "$dim" "$(when "$resets")" "$reset"
+      printf '%-7s %s  %s%s%3d%%%s  %s%s%s\n' "$label" "$window" "$(color_for "$pct")" "$(bar "$pct")" "$pct" "$reset" "$dim" "$text" "$reset"
     fi
     label=""
   done <<< "$rows"
   if [ $(( $(date +%s) - saved )) -gt "$stale_after" ]; then
-    printf '        %sas of %s. %s%s\n' "$dim" "$(when "$saved")" "$hint" "$reset"
+    printf '        %sas of %s%s\n' "$dim" "$(when "$saved")" "$reset"
   fi
 }
 
 render_panel() {
   collect_claude
   collect_codex
+  text_max=$(longest_text "$CLAUDE_ROWS" "$CODEX_ROWS")
   printf '%sAI usage%s  %s%s%s\n\n' "$bold" "$reset" "$dim" "$(date +%H:%M)" "$reset"
-  panel_tool Claude "$CLAUDE_STATE" "$CLAUDE_SAVED" "$CLAUDE_ROWS" "Updates when Claude Code replies."
+  panel_tool Claude "$CLAUDE_STATE" "$CLAUDE_SAVED" "$CLAUDE_ROWS"
   echo
-  panel_tool Codex "$CODEX_STATE" "$CODEX_SAVED" "$CODEX_ROWS" "Updates when Codex replies."
+  panel_tool Codex "$CODEX_STATE" "$CODEX_SAVED" "$CODEX_ROWS"
 }
 
 # short_tool <label> <state> <rows>
@@ -175,10 +223,11 @@ case "${1:-}" in
   --watch)
     interval=${2:-30}
     while true; do
+      cols=$(terminal_width)
       out=$(render_panel)
       printf '\033[H\033[2J%s\n' "$out"
       sleep "$interval"
     done ;;
-  "") render_panel ;;
+  "") cols=$(terminal_width); render_panel ;;
   *) usage >&2; exit 2 ;;
 esac
