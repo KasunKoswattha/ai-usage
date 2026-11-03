@@ -14,7 +14,9 @@ Codex   5h  █████████░  92%  resets 10:00
         7d  ██████░░░░  60%  resets Wed 04:59
 ```
 
-Bars turn yellow at 50% and red at 80%. A window that has already reset shows as fresh, and numbers more than an hour old get an "as of" note.
+The percentage is how much of each limit you've **used**. Bars are green below 50%, yellow from 50% and red from 80%, and at 100% the row says "limit reached". A window that has already reset shows as fresh, and numbers more than an hour old get an "as of" note.
+
+Both tools sometimes report only one window at a time, so `ai-usage` keeps the newest reading of each window separately and never drops a row just because the latest report left it out.
 
 ## How it gets the numbers
 

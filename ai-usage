@@ -12,7 +12,7 @@
 # Claude Code session replies. Codex's come from its session logs.
 set -u
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 claude_file="${AI_USAGE_CLAUDE_FILE:-${XDG_CACHE_HOME:-$HOME/.cache}/ai-usage/claude.json}"
 codex_sessions="${CODEX_HOME:-$HOME/.codex}/sessions"
 stale_after="${AI_USAGE_STALE_AFTER:-3600}"
@@ -52,12 +52,22 @@ collect_codex() {
   local files latest
   files=$(find "$codex_sessions" -name 'rollout-*.jsonl' -mtime -8 2>/dev/null | xargs ls -t 2>/dev/null | head -5)
   [ -n "$files" ] || return
+  # Codex logs several limits (limit_id "codex" is the plan limit; others such
+  # as "premium" can be empty or partial), and an event can omit a window.
+  # Keep the newest reading of each plan-limit window separately.
   # shellcheck disable=SC2086
-  latest=$(grep -h '"rate_limits":{' $files 2>/dev/null | jq -sc 'map(select(.payload.rate_limits != null)) | max_by(.timestamp) // empty')
+  latest=$(grep -h '"rate_limits":{' $files 2>/dev/null | jq -sc '
+    [ .[] | .timestamp as $t | .payload.rate_limits
+      | select(.limit_id == "codex" or .limit_id == null)
+      | .primary, .secondary
+      | select(. != null and .window_minutes != null and .used_percent != null)
+      | {t: $t, minutes: .window_minutes, used: .used_percent, resets: .resets_at} ]
+    | select(length > 0)
+    | {saved: (map(.t) | max), windows: (group_by(.minutes) | map(max_by(.t)) | sort_by(.minutes))}')
   [ -n "$latest" ] || return
-  CODEX_SAVED=$(printf '%s' "$latest" | jq -r '.timestamp | sub("\\.[0-9]+Z$"; "Z") | fromdate')
-  CODEX_ROWS=$(printf '%s' "$latest" | jq -r '.payload.rate_limits | [.primary, .secondary][] | select(. != null)
-    | "\(if .window_minutes == 300 then "5h" elif .window_minutes == 10080 then "7d" else "\(.window_minutes / 60 | floor)h" end) \(.used_percent | floor) \(.resets_at)"')
+  CODEX_SAVED=$(printf '%s' "$latest" | jq -r '.saved | sub("\\.[0-9]+Z$"; "Z") | fromdate')
+  CODEX_ROWS=$(printf '%s' "$latest" | jq -r '.windows[]
+    | "\(if .minutes == 300 then "5h" elif .minutes == 10080 then "7d" elif .minutes % 1440 == 0 then "\(.minutes / 1440)d" else "\(.minutes / 60 | floor)h" end) \(.used | floor) \(.resets)"')
   [ -n "$CODEX_ROWS" ] && CODEX_STATE=ok
 }
 
@@ -96,6 +106,8 @@ panel_tool() {
   while read -r window pct resets; do
     if [ "$(effective_pct "$pct" "$resets")" = 0 ] && [ "$pct" != 0 ]; then
       printf '%-7s %s  %s%s%s  %sreset at %s, fresh now%s\n' "$label" "$window" "$green" "$(bar 0)" "$reset" "$dim" "$(when "$resets")" "$reset"
+    elif [ "$pct" -ge 100 ]; then
+      printf '%-7s %s  %s%s %3d%%  limit reached, resets %s%s\n' "$label" "$window" "$red" "$(bar 100)" "$pct" "$(when "$resets")" "$reset"
     else
       printf '%-7s %s  %s%s %3d%%%s  %sresets %s%s\n' "$label" "$window" "$(color_for "$pct")" "$(bar "$pct")" "$pct" "$reset" "$dim" "$(when "$resets")" "$reset"
     fi
